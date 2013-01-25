@@ -1,0 +1,485 @@
+#!/usr/bin/python
+
+# TODO:
+# - handle case where a mobileconfig copied matches a differently-named file already installed
+#   - remove old file, maybe? (that would trigger another run)
+# - build automated test cases
+# - investigate user-level profiles
+
+import os
+import subprocess
+import tempfile
+import sys
+import logging
+from logging.handlers import RotatingFileHandler
+import optparse
+# Cheating for now and requiring Munki for FoundationPlist
+sys.path.append('/usr/local/munki/munkilib')
+from FoundationPlist import *
+
+PROFILES_CMD = '/usr/bin/profiles'
+IDENTIFIER_SUFFIX = '.LocalProfileManager'
+APP_DIR = '/Library/Local Profile Manager'
+
+# users currently not implemented
+PROFILES_DIR = os.path.join(APP_DIR, 'profiles')
+USER_PROFILES_DIR = os.path.join(PROFILES_DIR, 'users')
+COMPUTER_PROFILES_DIR = os.path.join(PROFILES_DIR, 'computer')
+
+# logging-related
+LOGS_DIR = os.path.join(APP_DIR, 'Logs')
+LOG_APP = os.path.join(LOGS_DIR, 'LocalProfileManager.log')
+LOG_ERROR = os.path.join(LOGS_DIR, 'lpm_error.log')
+L = logging.getLogger('com.github.localprofilemanager')
+
+
+class ConfigPayload():
+    """Class for an individual payload within a profile. The structure of
+    a profile output by 'profiles -P -o' is easier to compare content."""
+    def __init__(self, payload_object, mobileconfig=False):
+        # copy common keys
+        # TODO: Lots of sanity checking
+        self.identifier = payload_object['PayloadIdentifier']
+        self.display_name = payload_object.get('PayloadDisplayName', '')
+        self.uuid = payload_object['PayloadUUID']
+        self.version = payload_object['PayloadVersion']
+        self.type = payload_object['PayloadType']
+
+        # if this is a .mobileconfig we shuffle domain-specific keys
+        # out into a separate dict
+        if mobileconfig:
+            self.content = {}
+            for (k, v) in payload_object.items():
+                # common elements - note PayloadContent is not common
+                # at this level - it is used for at least the
+                # com.apple.ManagedClient.preferences type to store
+                # an MCX blob
+                if k not in ['PayloadIdentifier',
+                            'PayloadDisplayName',
+                            'PayloadUUID',
+                            'PayloadVersion',
+                            'PayloadType']:
+                    self.content[k] = v
+        else:
+            self.content = payload_object['PayloadContent']
+
+    def __eq__(self, other_payload):
+        # maybe _everything_ should be in one data dict and just copy
+        # the store's format verbatim. for now we keep each important
+        # key as its own class attribute.
+
+        # all payload class attributes must match
+        # http://www.saltycrane.com/blog/2008/09/how-iterate-over-instance-objects-data-attributes-python
+        for attr, value in self.__dict__.iteritems():
+            other_value = getattr(other_payload, attr, '')
+            L.debug("Comparing key values for %s" % attr)
+            if value != other_value:
+                L.debug("A operator value: %s" % value)
+                L.debug("B operator value: %s" % other_value)
+                L.info("Payload key %s has value %s, not equal to %s." % (
+                    attr, value, other_value))
+                return False
+
+        # otherwise we're equal
+        L.debug("Payload %s is equal." % self.identifier)
+        return True
+
+    def __ne__(self, other_payload):
+        return not (self == other_payload)
+
+
+class ConfigProfile():
+
+    def __init__(self):
+        self.description = None
+        self.display_name = None
+        self.identifier = None
+        self.install_date = None
+        self.organization = None
+        self.payloads = []
+        self.removal_disallowed = None
+        self.scope = 'System'   # no use for this right now
+        self.type = None
+        self.uuid = None
+        self.verification_state = None  # unused - to do with whether profile is signed
+        self.version = None
+
+    def populateFromMobileconfigObject(self, mobile_object):
+        # self.description = mobile_object['PayloadDescription']    # doesn't seem to be always included in PM (depending on user input?)
+        self.display_name = mobile_object['PayloadDisplayName']
+        self.identifier = mobile_object['PayloadIdentifier']
+        self.organization = mobile_object['PayloadOrganization']
+        self.removal_disallowed = mobile_object['PayloadRemovalDisallowed']
+        self.type = mobile_object['PayloadType']
+        self.uuid = mobile_object['PayloadUUID']
+        self.version = mobile_object['PayloadVersion']
+        self.verification_state = u'unsigned'
+
+        for mobileconfig_payload in mobile_object['PayloadContent']:
+            payload = ConfigPayload(mobileconfig_payload, mobileconfig=True)
+            self.payloads.append(payload)
+
+    def populateFromStoreObject(self, store_object):
+        # self.description = store_object['ProfileDescription']
+        self.display_name = store_object['ProfileDisplayName']
+        self.identifier = store_object['ProfileIdentifier']
+        self.organization = store_object['ProfileOrganization']
+        if store_object['ProfileUninstallPolicy'] == 'allowed':
+            self.removal_disallowed = False
+        else:
+            self.removal_disallowed = True  # TODO: check if there are more than two possible values for ProfileUninstallPolicy
+        self.type = store_object['ProfileType']
+        self.uuid = store_object['ProfileUUID']
+        self.verification_state = store_object['ProfileVerificationState']
+        self.version = store_object['ProfileVersion']
+
+        for store_payload in store_object['ProfileItems']:
+            payload = ConfigPayload(store_payload, mobileconfig=False)
+            self.payloads.append(payload)
+
+    def getPayloadUUIDSet(self):
+        """Returns the set of payload UUIDs"""
+        uuids = set()
+        for p in self.payloads:
+            L.debug("Adding payload uuid %s" % p.uuid)
+            uuids.add(p.uuid)
+        return uuids
+
+    def getPayloadByIdentifier(self, identifier):
+        """Return a ConfigPayload by its identifier"""
+        config_payload = None
+        for p in self.payloads:
+            if p.identifier == identifier:
+                config_payload = p
+        return config_payload
+
+    def getPayloadByUUID(self, uuid):
+        """Return a ConfigPayload by its identifier"""
+        config_payload = None
+        for p in self.payloads:
+            if p.uuid == uuid:
+                config_payload = p
+        return config_payload
+
+    def __eq__(self, other_profile):
+        my_uuids = self.getPayloadUUIDSet()
+        other_uuids = other_profile.getPayloadUUIDSet()
+        # L.debug("Payload A UUID set:")
+
+        # If set of UUIDs don't match in number or values
+        uuid_diff = my_uuids.symmetric_difference(other_uuids)
+        if uuid_diff:
+            L.info("Profiles don't have a matching set of UUIDs. Differences: %s" %
+                ', '.join([u for u in uuid_diff]))
+            return False
+
+        # Check most data attrs for equality
+        for attr in ['uuid',
+                     'organization',
+                     'display_name',
+                     'description',
+                     'version',
+                     'removal_disallowed',
+                     'type']:
+            if getattr(self, attr, '') != getattr(other_profile, attr, ''):
+                return False
+
+        # for each payload, get both paylods by uuid and compare them
+        for my_payload in self.payloads:
+            # other_payload = other_profile.getPayloadByUUID(self.uuid)
+            other_payload = other_profile.getPayloadByUUID(my_payload.uuid)
+            L.debug("Comparing payload %s" % my_payload.uuid)
+            if my_payload != other_payload:
+                L.info("Payloads don't have matching attributes. Profile not equal.")
+                return False
+
+        return True
+
+    def __ne__(self, other_profile):
+        return not (self == other_profile)
+      
+
+class ProfileStore():
+
+    def __init__(self):
+        self.refresh()
+
+    def refresh(self):
+        tmppath = os.path.join(tempfile.gettempdir(), 'tmp_profiles')
+        cmd = [PROFILES_CMD, '-P', '-o', tmppath]
+        subprocess.call(cmd, stdout=subprocess.PIPE)
+        profileData = readPlist(tmppath + '.plist')
+        self.data = profileData
+        os.remove(tmppath + '.plist')
+
+    def writeStoreDataToPlist(self, path):
+        writePlist(self.data, path)
+
+    def getProfileIdentifiers(self, scope='_computerlevel', managed_only=True):
+        ids = set()
+        if scope in self.data:
+            for profile in self.data[scope]:
+                if managed_only:
+                    if profile['ProfileIdentifier'].endswith(IDENTIFIER_SUFFIX):
+                        ids.add(profile['ProfileIdentifier'])
+                else:
+                    ids.add(profile['ProfileIdentifier'])
+        return ids
+
+    def getProfileDataByIdentifier(self, identifier, scope='_computerlevel'):
+        profile_data = None
+        # Making sure we have something in the specified scope
+        if scope in self.data.keys():
+            for profile in self.data[scope]:
+                if identifier == profile['ProfileIdentifier']:
+                    profile_data = profile
+        return profile_data
+
+    def getProfileIdsForObject(self, scope):
+        results = []
+        for profile in self.data[scope]:
+            result = {}
+            result[profile['ProfileIdentifier']] = profile['ProfileUUID']
+            results.append(result)
+        return results
+
+
+def initLogging():
+    log_stdout_handler = logging.StreamHandler(stream=sys.stdout)
+    log_app_file_handler = RotatingFileHandler(LOG_APP,
+                                    maxBytes=1000000,
+                                    backupCount=9)
+    log_error_file_handler = RotatingFileHandler(LOG_ERROR,
+                                    maxBytes=1000000,
+                                    backupCount=9)
+    log_error_file_handler.setLevel(logging.ERROR)
+
+    for handler in [log_stdout_handler, log_app_file_handler, log_error_file_handler]:
+        L.addHandler(handler)
+
+    log_format_basic = logging.Formatter("%(levelname)s: %(message)s")
+    log_format_detailed = logging.Formatter("%(asctime)s %(levelname)s: %(message)s",
+                                            datefmt="%b %d %Y %H:%M:%S")
+    log_stdout_handler.setFormatter(log_format_basic)
+    log_app_file_handler.setFormatter(log_format_detailed)
+    log_error_file_handler.setFormatter(log_format_detailed)
+
+
+def verifySupportDirs():
+    for d in [APP_DIR, PROFILES_DIR, COMPUTER_PROFILES_DIR, LOGS_DIR]:
+        if not os.path.isdir(d):
+            os.mkdir(d)
+
+
+def removeAllProfiles():
+    cmd = [PROFILES_CMD, '-D']
+    retcode = subprocess.call(cmd)
+    print "Deletion returned code %s." % retcode
+
+
+def getProfileInfo(profile_store, scope):
+    results = []
+    for profile in profile_store[scope]:
+        result = {}
+        result[profile['ProfileIdentifier']] = profile['ProfileUUID']
+        results.append(result)
+    return results
+
+
+def getMobileconfigValuesFromFilesByKeyname(file_list, keyname):
+    result = set()
+    for f in file_list:
+        plist = readPlist(f)
+        result.add(plist[keyname])
+    return result
+
+
+def getProfilesFromDir():
+    results = None
+
+    for f in os.listdir(PROFILES_DIR):
+        path = os.path.join(PROFILES_DIR, f)
+        if os.path.isfile(path):
+            try:
+                f_contents = readPlist(path)
+            except:
+                L.error("There was an error reading the profile contents at %s." % path)
+                pass
+
+            if 'PayloadType' in f_contents.keys():
+                if f_contents['PayloadType'] == 'Configuration':
+                    profile = {}
+                    profile['Path'] = path
+                    profile['ProfileIdentifier'] = f_contents['PayloadIdentifier']
+                    profile['ProfileUUID'] = f_contents['PayloadUUID']
+                    results.append(profile)
+    return results
+
+
+def checkAndAppendIdentifierSuffix(profile_path):
+    """Append our app's suffix the profile identifier so we can determine
+    later whether we installed it."""
+    profile_data = readPlist(profile_path)
+    # print profile_data
+    if not profile_data['PayloadIdentifier'].endswith(IDENTIFIER_SUFFIX):
+        profile_data['PayloadIdentifier'] += IDENTIFIER_SUFFIX
+        writePlist(profile_data, profile_path)
+
+
+def installProfile(profile_path, scope='_computerlevel'):
+    cmd = [PROFILES_CMD, '-I', '-F', profile_path]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = p.communicate()
+    retcode = p.returncode
+    L.info("Install of %s returned %s." % (os.path.basename(profile_path),
+                                        retcode))
+    return retcode
+
+
+def removeProfile(profile_identifier, scope='_computerlevel'):
+    cmd = [PROFILES_CMD, '-R', '-p', profile_identifier]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = p.communicate()
+    retcode = p.returncode
+    L.info("Removal of %s returned %s." % (profile_identifier, retcode))
+    return retcode
+
+
+def getFullPathsInDirectory(directory):
+    paths = []
+    for f in os.listdir(directory):
+        f_fullpath = os.path.join(directory, f)
+        paths.append(os.path.abspath(f_fullpath))
+    return paths
+
+def getSignedMobileconfigData(path):
+    result = None
+    start_string = """<?xml version="1.0" encoding="UTF-8"?>"""
+    end_string = """</plist>"""
+
+    with open(path, 'rb') as fd:
+        data = fd.read()
+        begin = data.find(start_string)
+        if begin != -1:
+            end = data.find(end_string)
+            fd.seek(begin + 1)
+            xml = fd.read(end - begin + len(end_string))
+            try:
+                plist_data = readPlistFromString(xml)
+                result = plist_data
+            except NSPropertyListSerializationException:
+                print "Couldn't read plist from data!"
+    return result
+
+def main():
+    o = optparse.OptionParser()
+    o.add_option('--verbose', '-v', action='count', default=0,
+                        help="""More verbose output. May be specified multiple
+                         times.""")
+    opts, args = o.parse_args()
+
+    if os.getuid() != 0:
+        sys.exit("You must be root to run %s!" % os.path.basename(sys.argv[0]))
+
+    verifySupportDirs()
+    # logging init
+    initLogging()
+    if opts.verbose >= 2:
+        log_level = logging.DEBUG
+    elif opts.verbose == 1:
+        log_level = logging.INFO
+    else:
+        log_level = logging.WARNING
+    print "Logging at level %s, %s." % (log_level, logging.getLevelName(log_level))
+    L.setLevel(log_level)
+
+    # how did we get called?
+    ran_via_launchd = True
+    if os.getppid() != 1:           # parent PID is 1 for launchd
+        ran_via_launchd = False
+    L.warn("%s started." % os.path.basename(sys.argv[0]))
+    if ran_via_launchd:
+        L.warn("Triggered by launchd.")
+    else:
+        L.warn("Triggered manually.")
+
+    profiles_filelist = getFullPathsInDirectory(COMPUTER_PROFILES_DIR)
+
+    profile_store = ProfileStore()
+    L.debug("Profile store data:")
+    L.debug(profile_store.data)
+    L.info("Writing store data to plist for reference..")
+    profile_store.writeStoreDataToPlist(os.path.join(os.getcwd(), 'store.plist'))
+
+    scope = '_computerlevel'
+    install_list, removal_list = set(), set()
+
+    all_ids_present = profile_store.getProfileIdentifiers(scope=scope,
+                                                        managed_only=False)
+    managed_ids_present = profile_store.getProfileIdentifiers(scope=scope,
+                                                        managed_only=True)
+    profile_ids_in_dir = getMobileconfigValuesFromFilesByKeyname(profiles_filelist, 'PayloadIdentifier')
+    # if installed profiles are a superset of those in our control dir, mark the unique ones for removal
+    if (managed_ids_present > profile_ids_in_dir) or \
+       (managed_ids_present and not profile_ids_in_dir):
+        removal_list = managed_ids_present - profile_ids_in_dir
+        L.info("Profiles %s are installed but aren't in the profiles directory, marking for removal." % (
+            ', '.join(removal_list)))
+
+    L.info("Managed profiles installed: %s" % managed_ids_present)
+    L.info("Profiles stored for scope %s: total %s, managed %s" % (
+                scope, len(all_ids_present), len(managed_ids_present)))
+
+
+    for candidate_profile in profiles_filelist:
+        try:
+            readPlist(candidate_profile)
+        except NSPropertyListSerializationException:
+            # Here we would try to pull from a binary signed profile,
+            # but we can't modify the identifier suffix ourselves and have it still work,
+            # so we'd require that signed profiles already have a suffixed identifier
+            pass
+
+        checkAndAppendIdentifierSuffix(candidate_profile)   # (we can't do this if it's signed..)
+        # get our candidate and stored profile data
+        candidate_profile_data = readPlist(candidate_profile)
+        candidate_identifier = candidate_profile_data['PayloadIdentifier']
+        store_profile_data = profile_store.getProfileDataByIdentifier(candidate_identifier,
+                                                                    scope=scope)
+        if candidate_identifier not in managed_ids_present:
+            L.warn("Profile %s is not installed (detected by identifier only), installing..." %
+                    os.path.basename(candidate_profile))
+            install_list.add(candidate_profile)
+
+        elif store_profile_data is None:
+            L.warn("Profile %s is not installed (no object exists in store), installing..." %
+                    os.path.basename(candidate_profile))
+            install_list.add(candidate_profile)
+
+        else:   # ie. the profile exists in the store, so we want to compare
+            candidate_obj = ConfigProfile()
+            store_obj = ConfigProfile()
+            candidate_obj.populateFromMobileconfigObject(candidate_profile_data)
+            L.debug("Candidate ConfigProfile object:")
+            L.debug(candidate_obj.__dict__)
+            store_obj.populateFromStoreObject(store_profile_data)
+            L.debug("Stored ConfigProfile object")
+            L.debug(store_obj.__dict__)
+            if candidate_obj != store_obj:
+                L.warn("Candidate profile data does not equal stored profile data, installing...")
+                install_list.add(candidate_profile)
+
+    if removal_list:
+        L.info("Removing profiles: %s" % ', '.join(removal_list))
+        for to_remove in removal_list:
+            removeProfile(to_remove)
+
+    if install_list:
+        L.info("Profiles to install: \n- %s" % '\n- '.join([os.path.basename(f) for f in install_list]))
+        for to_install in install_list:
+            L.info("Installing %s..." % to_install)
+            installProfile(to_install)
+
+
+if __name__ == "__main__":
+    main()
